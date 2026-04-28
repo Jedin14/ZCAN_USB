@@ -18,7 +18,9 @@
  *  - RX frames arrive as raw 21-byte packets on EP2/EP3
  *  - Both channels must be initialized for stable RX after TX
  *
- * Author: Reverse-engineered from USB captures and libcontrolcanfd.a
+ * Author: Manuel Rösel
+ * manuel.roesel@ros-it.ch
+ * Reverse-engineered from USB captures and libcontrolcanfd.a
  * License: GPL v2
  */
 
