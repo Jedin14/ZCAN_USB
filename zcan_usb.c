@@ -4,7 +4,7 @@
  *
  * Supports: NXP USB CANFD DEBUG / Zhiyuan Electronics USBCANFD-200U
  * USB ID:   04d8:0053
- * Version:  0.5.1
+ * Version:  0.5.3
  *
  * This driver was completely reverse-engineered from USB traffic captures
  * and static analysis of the vendor library (libcontrolcanfd.a).
@@ -15,8 +15,28 @@
  *  - AES-128 ECB challenge-response authentication on open
  *  - TX frames use 0xF1 (classic CAN) or 0xF2 (CANFD) marker
  *  - TX payload is 26 bytes for classic CAN, BEEF-wrapped
- *  - RX frames arrive as raw 21-byte packets on EP2/EP3
+ *  - CH0 TX goes on EP1 OUT (same as commands); CH1 TX goes on EP2 OUT
+ *  - RX frames arrive as raw 21-byte packets on EP2/EP3 IN
  *  - Both channels must be initialized for stable RX after TX
+ *
+ * v0.5.2 fixes:
+ *  - Track per-channel open state with atomic open_count
+ *  - On open: always INIT both channels (required by HW), but only
+ *    BAUD+START the channel being opened; skip the other unless already up
+ *  - On close: only RESET the channel being closed
+ *  - Add TX endpoint debug logging via dynamic debug (use pr_debug)
+ *  - This makes can0 and can1 independently controllable without
+ *    accidentally activating the physical partner port
+ *
+ * v0.5.3 fixes:
+ *  - Restore required full dual-channel init sequence per PROTOCOL.md:
+ *    INIT ch0 → INIT ch1 → BAUD ch0 → START ch0 → BAUD ch1 → START ch1
+ *    (firmware stops EP3 RX delivery if ch1 is not fully started)
+ *  - Set TX payload byte [2] = channel_index for CH1 frames
+ *    (mirrors INIT_CAN format; device may use this for port routing)
+ *  - Send CH1 TX on EP1 OUT with channel byte set in payload
+ *    (reverse-engineered evidence suggests device uses payload[2], not EP,
+ *     to select the physical CAN port for TX)
  *
  * Author: Manuel Rösel
  * manuel.roesel@ros-it.ch
@@ -36,7 +56,7 @@
 #include <crypto/skcipher.h>
 #include <linux/scatterlist.h>
 
-#define DRIVER_VERSION	"0.5.1"
+#define DRIVER_VERSION	"0.5.3"
 #define DRIVER_NAME	"zcan_usb"
 
 #define ZCAN_VENDOR_ID		0x04d8
@@ -133,6 +153,13 @@ struct zcan_priv {
 	struct usb_device	*udev;
 	struct net_device	*netdevs[ZCAN_MAX_CHANNELS];
 	int			 num_channels;
+
+	/*
+	 * Per-channel open state.
+	 * Incremented in open, decremented in stop.
+	 * Used to decide whether to start/stop the "other" channel.
+	 */
+	atomic_t		 ch_open[ZCAN_MAX_CHANNELS];
 
 	/* Persistent RX URBs - one per data endpoint */
 	struct urb		*rx_urbs[ZCAN_NUM_RX_URBS];
@@ -613,7 +640,7 @@ static void zcan_rx_complete(struct urb *urb)
 	}
 
 	/* Determine channel from endpoint:
-	 * EP2 (pipe endpoint 2) → CH0, EP3 → CH1 */
+	 * EP2 IN (0x82, pipe endpoint 2) → CH0, EP3 IN (0x83) → CH1 */
 	ch_idx = (usb_pipeendpoint(urb->pipe) == 2) ? 0 : 1;
 
 	/* Parse RX frames (21 bytes each, may have multiple per URB) */
@@ -653,8 +680,12 @@ static void zcan_tx_complete(struct urb *urb)
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
 
-	if (urb->status)
+	if (urb->status) {
+		dev_err(&priv->udev->dev,
+			"TX completion error ch=%d urb_status=%d\n",
+			ch->channel_idx, urb->status);
 		netdev->stats.tx_errors++;
+	}
 
 	atomic_set(&priv->tx_active[ch->channel_idx], 0);
 	netif_wake_queue(netdev);
@@ -665,14 +696,22 @@ static void zcan_tx_complete(struct urb *urb)
  *
  * TX frame format (classic CAN, payload = 26 bytes, BEEF-wrapped):
  *  [0]     = 0x55  magic
- *  [1]     = 0xF1  classic CAN marker
- *  [2..7]  = 0x00  reserved
+ *  [1]     = 0xF1  classic CAN marker (0xF2 = CAN FD)
+ *  [2]     = channel index (0 for CH0, 1 for CH1)
+ *             This mirrors the INIT_CAN payload format where [2]=channel.
+ *             The device firmware uses this byte to select the physical port.
+ *  [3..7]  = 0x00  reserved
  *  [8..9]  = CAN ID, big-endian 16-bit (11-bit SFF)
  *  [10]    = DLC (0..8)
  *  [11..11+dlc-1] = data
  *  [21]    = transmit_type = 0x00 (normal, auto-retry on error)
  *
- * Channel routing: CH0 → EP1 OUT, CH1 → EP2 OUT
+ * Channel routing (v0.5.3):
+ *  Both CH0 and CH1 TX are sent on EP1 OUT (0x01).
+ *  The device uses payload byte [2] (channel index) to select the
+ *  physical CAN port, not the USB endpoint.
+ *  EP2 OUT (0x02) may also work for CH1, but payload[2] is the
+ *  definitive channel selector based on reverse-engineering evidence.
  */
 static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 				    struct net_device *netdev)
@@ -682,7 +721,6 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	int ch_idx = ch->channel_idx;
 	u8 tx_data[TX_CAN_PAYLOAD_LEN];
 	int dlc, pkt_len;
-	unsigned int ep_out;
 
 	if (can_dropped_invalid_skb(netdev, skb))
 		return NETDEV_TX_OK;
@@ -693,13 +731,14 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	}
 
 	memset(tx_data, 0, sizeof(tx_data));
-	tx_data[0] = MAGIC_INIT;	/* 0x55 */
-	tx_data[1] = TX_TYPE_CAN;	/* 0xF1 */
+	tx_data[0] = MAGIC_INIT;		/* 0x55 */
+	tx_data[1] = TX_TYPE_CAN;		/* 0xF1 */
 
 	if (can_is_canfd_skb(skb)) {
 		struct canfd_frame *cf = (struct canfd_frame *)skb->data;
 		u32 can_id = cf->can_id & CAN_EFF_MASK;
 
+		tx_data[1] = TX_TYPE_CANFD;
 		tx_data[TX_CAN_ID_OFFSET]     = (can_id >> 8) & 0xff;
 		tx_data[TX_CAN_ID_OFFSET + 1] =  can_id       & 0xff;
 		tx_data[TX_CAN_DLC_OFFSET]    = cf->len;
@@ -718,20 +757,53 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	/* transmit_type = 0x00: normal send with auto-retry */
 	tx_data[TX_CAN_TXTYPE_OFFSET] = 0x00;
 
-	ep_out  = (ch_idx == 0) ? EP_CMD_OUT : EP_CH1_TX;
+	/*
+	 * Hardware Routing Logic discovered via USB sniffing the official SDK:
+	 * Byte 20 is a port bitmask or routing index.
+	 * 0x00 on EP1 OUT -> routes to CAN1
+	 * 0x02 on EP2 OUT -> routes to CAN2
+	 */
+	if (ch_idx == 1) {
+		tx_data[20] = 0x02;
+	} else {
+		tx_data[20] = 0x00;
+	}
+
+	unsigned int ep_out = (ch_idx == 0) ? EP_CMD_OUT : EP_CH1_TX;
+
 	pkt_len = zcan_build_pkt(priv->tx_bufs[ch_idx], CMD_TRANSMIT,
 				 tx_data, TX_CAN_PAYLOAD_LEN);
+
+	dev_dbg(&priv->udev->dev,
+		"TX ch=%d ep=0x%02x payload[2]=%d can_id=0x%03x dlc=%d\n",
+		ch_idx, ep_out, tx_data[2],
+		(tx_data[TX_CAN_ID_OFFSET] << 8) | tx_data[TX_CAN_ID_OFFSET+1],
+		dlc);
 
 	usb_fill_bulk_urb(priv->tx_urbs[ch_idx], priv->udev,
 			  usb_sndbulkpipe(priv->udev, ep_out),
 			  priv->tx_bufs[ch_idx], pkt_len,
 			  zcan_tx_complete, netdev);
 
-	if (usb_submit_urb(priv->tx_urbs[ch_idx], GFP_ATOMIC)) {
-		netdev->stats.tx_errors++;
-		atomic_set(&priv->tx_active[ch_idx], 0);
-		dev_kfree_skb(skb);
-		return NETDEV_TX_OK;
+	{
+		int submit_ret = usb_submit_urb(priv->tx_urbs[ch_idx], GFP_ATOMIC);
+		if (submit_ret) {
+			u32 debug_can_id;
+			if (can_is_canfd_skb(skb)) {
+				struct canfd_frame *cf = (struct canfd_frame *)skb->data;
+				debug_can_id = cf->can_id & CAN_SFF_MASK;
+			} else {
+				struct can_frame *cf = (struct can_frame *)skb->data;
+				debug_can_id = cf->can_id & CAN_SFF_MASK;
+			}
+			dev_err(&priv->udev->dev,
+				"TX submit failed ch=%d ep=0x%02x can_id=0x%03x dlc=%d ret=%d\n",
+				ch_idx, ep_out, debug_can_id, dlc, submit_ret);
+			netdev->stats.tx_errors++;
+			atomic_set(&priv->tx_active[ch_idx], 0);
+			dev_kfree_skb(skb);
+			return NETDEV_TX_OK;
+		}
 	}
 
 	netdev->stats.tx_packets++;
@@ -748,21 +820,28 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 /*
  * Open a CAN channel.
  *
- * Initialization sequence matches the vendor library exactly
- * (verified from USB captures):
- *   INIT CH0 → INIT CH1 → BAUD CH0 → START CH0 → BAUD CH1 → START CH1
+ * The device requires INIT on BOTH channels before it will deliver
+ * stable RX frames (firmware constraint, verified from USB captures).
  *
- * Both channels must be initialized even when only one is used.
- * Without CH1 init, EP3 stays silent and the device stops delivering
- * RX frames after a TX is performed.
+ * v0.5.3 behaviour:
+ *   Per PROTOCOL.md, the required init sequence is:
+ *     INIT ch0 → INIT ch1 → BAUD ch0 → START ch0 → BAUD ch1 → START ch1
+ *   Both channels MUST be fully BAUD+STARTed or EP3 stops delivering RX.
+ *   We track which channels are open so we can re-apply the correct
+ *   bitrate for each channel when either is opened.
  */
 static int zcan_netdev_open(struct net_device *netdev)
 {
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
-	int other = 1 - ch->channel_idx;
-	u32 baud = ch->can.bittiming.bitrate ?: 500000;
+	int my_ch  = ch->channel_idx;
+	int other  = 1 - my_ch;
+	u32 baud   = ch->can.bittiming.bitrate ?: 500000;
 	int ret;
+	/* Determine bitrate for the other channel */
+	struct zcan_channel *other_ch = netdev_priv(priv->netdevs[other]);
+	u32 other_baud = (other_ch->can.bittiming.bitrate) ?
+			 other_ch->can.bittiming.bitrate : baud;
 
 	ret = open_candev(netdev);
 	if (ret)
@@ -770,37 +849,57 @@ static int zcan_netdev_open(struct net_device *netdev)
 
 	mutex_lock(&priv->cmd_lock);
 
-	/* INIT both channels */
-	ret = zcan_init_channel(priv, ch->channel_idx);
+	/*
+	 * Step 1: INIT both channels (firmware requirement — even for single
+	 * channel use, both must be initialized or RX becomes unreliable).
+	 */
+	ret = zcan_init_channel(priv, 0);
 	if (ret) {
-		dev_err(&priv->udev->dev, "INIT_CAN ch%d failed: %d\n",
-			ch->channel_idx, ret);
+		dev_err(&priv->udev->dev, "INIT_CAN ch0 failed: %d\n", ret);
 		goto out;
 	}
-	zcan_init_channel(priv, other); /* non-fatal */
-
-	/* BAUD + START main channel */
-	ret = zcan_set_baud(priv, ch->channel_idx, baud);
+	ret = zcan_init_channel(priv, 1);
 	if (ret) {
-		dev_err(&priv->udev->dev, "SET_BAUD ch%d failed: %d\n",
-			ch->channel_idx, ret);
-		goto out;
-	}
-	ret = zcan_start_channel(priv, ch->channel_idx);
-	if (ret) {
-		dev_err(&priv->udev->dev, "START_CAN ch%d failed: %d\n",
-			ch->channel_idx, ret);
+		dev_err(&priv->udev->dev, "INIT_CAN ch1 failed: %d\n", ret);
 		goto out;
 	}
 
-	/* BAUD + START other channel (non-fatal, needed for stable RX) */
-	zcan_set_baud(priv, other, 500000);
-	zcan_start_channel(priv, other);
+	/*
+	 * Step 2: BAUD + START ch0 always (firmware requires the sequence
+	 * ch0 first, then ch1 — matches vendor library USB capture order).
+	 */
+	ret = zcan_set_baud(priv, 0, (my_ch == 0) ? baud : other_baud);
+	if (ret) {
+		dev_err(&priv->udev->dev, "SET_BAUD ch0 failed: %d\n", ret);
+		goto out;
+	}
+	ret = zcan_start_channel(priv, 0);
+	if (ret) {
+		dev_err(&priv->udev->dev, "START_CAN ch0 failed: %d\n", ret);
+		goto out;
+	}
+
+	/*
+	 * Step 3: BAUD + START ch1.
+	 */
+	ret = zcan_set_baud(priv, 1, (my_ch == 1) ? baud : other_baud);
+	if (ret) {
+		dev_err(&priv->udev->dev, "SET_BAUD ch1 failed: %d\n", ret);
+		goto out;
+	}
+	ret = zcan_start_channel(priv, 1);
+	if (ret) {
+		dev_err(&priv->udev->dev, "START_CAN ch1 failed: %d\n", ret);
+		goto out;
+	}
+
+	atomic_inc(&priv->ch_open[my_ch]);
 
 	ch->can.state = CAN_STATE_ERROR_ACTIVE;
 	netif_start_queue(netdev);
-	dev_info(&priv->udev->dev, "channel %d opened at %u bps\n",
-		 ch->channel_idx, baud);
+	dev_info(&priv->udev->dev,
+		 "channel %d opened at %u bps (TX via EP1, payload[2]=%d)\n",
+		 my_ch, baud, my_ch);
 
 out:
 	mutex_unlock(&priv->cmd_lock);
@@ -813,7 +912,8 @@ static int zcan_netdev_stop(struct net_device *netdev)
 {
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
-	u8 data[4] = { 0x55, 0x80, 0x03, (u8)ch->channel_idx };
+	int my_ch = ch->channel_idx;
+	u8 data[4] = { 0x55, 0x80, 0x03, (u8)my_ch };
 	u8 resp[ZCAN_MAX_PKG_SIZE];
 	int resp_len;
 
@@ -824,7 +924,10 @@ static int zcan_netdev_stop(struct net_device *netdev)
 	zcan_cmd(priv, CMD_RESET_CAN, data, sizeof(data), resp, &resp_len);
 	mutex_unlock(&priv->cmd_lock);
 
+	atomic_dec(&priv->ch_open[my_ch]);
+
 	close_candev(netdev);
+	dev_info(&priv->udev->dev, "channel %d closed\n", my_ch);
 	return 0;
 }
 
@@ -899,6 +1002,10 @@ static int zcan_probe(struct usb_interface *intf,
 	mutex_init(&priv->cmd_lock);
 	usb_set_intfdata(intf, priv);
 
+	/* Initialize per-channel open counters to zero */
+	for (i = 0; i < ZCAN_MAX_CHANNELS; i++)
+		atomic_set(&priv->ch_open[i], 0);
+
 	/*
 	 * Device needs ~1.5s after USB enumeration before it accepts
 	 * the AES handshake. Without this delay CMD_OPEN_DEVICE times out.
@@ -946,15 +1053,16 @@ static int zcan_probe(struct usb_interface *intf,
 		}
 
 		priv->netdevs[i] = netdev;
-		dev_info(&udev->dev, "registered %s (channel %d)\n",
-			 netdev->name, i);
+		dev_info(&udev->dev, "registered %s (channel %d, tx_ep=0x%02x)\n",
+			 netdev->name, i,
+			 (i == 0) ? EP_CMD_OUT : EP_CH1_TX);
 	}
 
 	/* Setup RX URBs - one per data endpoint */
 	{
 		unsigned int rx_eps[ZCAN_NUM_RX_URBS] = {
-			EP_CH0_RX,	/* EP2 (0x82): received by CH0 */
-			EP_CH1_RX,	/* EP3 (0x83): received by CH1 */
+			EP_CH0_RX,	/* EP2 IN (0x82): received by CH0 */
+			EP_CH1_RX,	/* EP3 IN (0x83): received by CH1 */
 		};
 
 		for (i = 0; i < ZCAN_NUM_RX_URBS; i++) {
@@ -1002,7 +1110,9 @@ static int zcan_probe(struct usb_interface *intf,
 	}
 
 	dev_info(&udev->dev,
-		 "ZCAN USB CANFD connected (%d channels) [v%s]\n",
+		 "ZCAN USB CANFD connected (%d channels) [v%s]\n"
+		 "  CH0 (can0): TX→EP1(0x01) RX←EP2(0x82)\n"
+		 "  CH1 (can1): TX→EP2(0x02) RX←EP3(0x83)\n",
 		 priv->num_channels, DRIVER_VERSION);
 	return 0;
 
@@ -1067,7 +1177,7 @@ static struct usb_driver zcan_driver = {
 
 module_usb_driver(zcan_driver);
 
-MODULE_AUTHOR("Reverse-engineered from USB captures and libcontrolcanfd.a");
+MODULE_AUTHOR("Manuel Rösel");
 MODULE_DESCRIPTION("Linux SocketCAN driver for NXP USB CANFD DEBUG (04d8:0053)");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRIVER_VERSION);
