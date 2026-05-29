@@ -41,7 +41,19 @@ sudo apt install linux-headers-$(uname -r) can-utils
 
 ---
 
-## Build & Install
+## Quick Install
+
+On a new PC, simply clone this repository and run the provided install script. This will compile the driver and register it with DKMS so that it automatically rebuilds when you update your kernel.
+
+```bash
+git clone https://github.com/Jedin14/ZCAN_USB.git
+cd ZCAN_USB
+sudo ./install_driver.sh
+```
+
+That's it! The driver will be loaded, and `can0` / `can1` will be available whenever you plug in the adapter. You can then bring the interfaces up with standard `ip link` commands (e.g., `sudo ip link set can0 type can bitrate 1000000 up`).
+
+## Build (Manual) & Install
 
 ### Manual
 
